@@ -1,0 +1,149 @@
+---
+title: "Global Baseline Estimate"
+subtitle: "DATA 607: Week 3A Assignment"
+date: "September 19, 2026"
+author: "Bowen C"
+format: html
+editor: visual
+---
+
+## Approach
+
+Last week we collected ratings for some recent movies that people have seen. Using fabricated data, I "collected" ratings for 14 films from 5 "people."
+
+This week we are tasked with implementing a Global Baseline Estimate recommendation system in R. The implementation algorithm and the formulas are provided in an Excel spreadsheet.
+
+The "problem" for which we want to find a solution can be expressed as follows: How would one of our raters rate a film which they haven't seen yet? Can we use our existing ratings data in a model to predict what their rating would be? Can we use those predictions to recommend a film for each of our raters?
+
+Darwhin provided the majority of the code we need for this assignment in Meetup 3. I decided to try a different approach for the last step, however, which was more intuitive to me.
+
+## Code Base
+
+This first block of code is simply replicating some of my work from 2A, so that I can import the movie ratings data from PostgreSQL:
+
+```{r}
+library(RPostgreSQL)
+
+db607 <- dbConnect(
+  RPostgreSQL::PostgreSQL(),
+  dbname = "DATA 607",
+  host = "localhost",
+  user = "postgres",
+  password = ""
+)
+
+movies <- DBI::dbReadTable(db607, "movies")
+users <- DBI::dbReadTable(db607, "users")
+movie_info <- DBI::dbReadTable(db607, "movie_info")
+
+library(tidyverse)
+movies <- movies %>%
+  mutate(user_id = as.character(as.integer(user_id)))
+
+movies <- movies %>%
+  left_join(users %>%
+              select(user_id, name), by = "user_id")
+
+movies <- movies %>%
+  select(-user_id)
+```
+
+First I will calculate the average movie rating for each film using the ratings from all the raters. The `mean` function sums the ratings in each row and divides by the total number of rows. I will store this value in a variable called Global_Mean_Rating, which we will need later to calculate the Global Baseline Estimates.
+
+```{r}
+Global_Mean_Rating <- mean(movies$rating)
+```
+
+Next we calculate the Critic_Bias, which measures how much our raters tend to rate movies above or below the global mean. This is calculated by subtracting Global_Mean_Rating from the mean rating for an individual rater (code from Darwhin Gomez, Meetup 3).
+
+```{r}
+User_Bias <- movies %>%
+  group_by(name) %>%
+  summarize(Critic_Bias = mean(rating) - Global_Mean_Rating)
+```
+
+Now we calculate Movie_Bias, which measures how much a movie rates on average above or below the Global_Mean_Rating. This is calculated by subtracting Global_Mean_Rating from the average rating for a film (code from Darwhin Gomez, Meetup 3).
+
+```{r}
+Item_Bias <- movies %>%
+  group_by(movie) %>%
+  summarize(Movie_Bias = mean(rating) - Global_Mean_Rating)
+```
+
+We have created tibbles of rater and movie biases, and now we can calculate predicted ratings for every movie that has not yet been seen for each rater. For each rater, the recommended film is the one with the highest predicted rating.
+
+There are probably many ways to approach this. Darwhin provided one such solution in Meetup 3 using various `join` functions and `arrange`, but I wanted to try a more straightforward approach. My approach isn't elegant or simple. It uses many more steps, but it's easier for me to wrap my head around.
+
+First I created a new dataset called `predicted` for all possible pairs of raters and movies using `expand_grid`, which creates a new data frame with all combinations of values for the selected variables. Since I have repeating combinations in the `movies` data set, I need to use the 'unique' function to remove those duplicate combinations of "movie" and "name":
+
+```{r}
+predicted <- expand_grid(
+  name = unique(movies$name),
+  movie = unique(movies$movie)
+)
+```
+
+Then I used `mutate` to add a new column for the predicted ratings. Note that this includes new predicted ratings for movies that each person has already seen. I will handle that next.
+
+```{r}
+predicted <- predicted %>%
+  mutate(
+    Critic_Bias = User_Bias$Critic_Bias[
+      match(name, User_Bias$name)
+    ],
+    Movie_Bias = Item_Bias$Movie_Bias[
+      match(movie, Item_Bias$movie)
+    ],
+    predicted_rating = Global_Mean_Rating + Movie_Bias + Critic_Bias
+  )
+```
+
+Using `anti_join`, I can remove predicted values for movies that have already been seen by a rater. I specify the columns ("name" and "movie") I want to be checked in the original `movies` data frame. If paired values already exist for those two columns, the corresponding rows will be removed from the `predicted` tibble:
+
+```{r}
+predicted <- predicted %>%
+  anti_join(movies, by = c("name", "movie"))
+```
+
+To check my work so far, I will pivot both the original `movies` data frame and the new `predicated` data frame to wide format. It is easier to compare the data in these formats. (In the last line of code for this code chunk I sort the movie name columns alphabetically to facilitate comparison. `names(movies_wide)[-1]` excludes the first column, which is "name", and gets the names of the remaining columns. The order function then returns the index numbers to sort those columns alphabetically. I then add one to this list of index numbers so that they are all increased by 1, to account for the fact that we omitted the first column from sorting.)
+
+```{r}
+movies_wide <- movies %>%
+  pivot_wider(
+  names_from = movie,
+  values_from = rating)
+
+movies_wide <- movies_wide[, c(1, order(names(movies_wide)[-1]) + 1)]
+```
+
+```{r}
+predicted_wide <- predicted %>%
+  select(name, movie, predicted_rating) %>%
+  pivot_wider(
+    id_cols = name,
+    names_from = movie,
+    values_from = predicted_rating)
+
+predicted_wide <- predicted_wide[, c(1, order(names(predicted_wide)[-1]) + 1)]
+```
+
+Comparing the two data frames in wide format, there should be an NA in every place in the `predicted_wide` data frame where there was a value in the `movies_wide` data frame. Similarly, the `predicted_wide` data frame should now have predicted values in every cell that had a missing value in the `movies_wide` data frame.
+
+Everything checks out. So finally, I can sort my original `predicted` tibble to see the movies corresponding to the maximum predicted values for each rater. `slice_max` is similar to the `max` function but it returns the entire row corresponding to the maximum value of a variable rather than the maximum value alone.
+
+```{r}
+predicted <- predicted %>%
+  group_by(name) %>%
+  slice_max(predicted_rating, n = 1, with_ties = FALSE) %>%
+  select(name, movie, predicted_rating)
+
+print(predicted)
+```
+
+## Conclusion:
+
+It's both funny and surprising that Coyote vs. Acme is the top recommended film for 4 out of 5 of my raters. Looking at `movies_wide,` it becomes immediately apparent what happened. Although Coyote vs. Acme is not the only film to receive a "9" (the highest score given) among my raters, all the other films that received a "9" from at least one rater had their average rating lowered by other raters. Coyote vs. Acme, on the other hand, only received one rating and so the "9" carries a lot of weight. Better, or at least more sophisticated, prediction and recommendation algorithms should probably take into account the number of raters.
+
+## References
+
+Wickham et al. (2023). R for Data Science. Sebastopol: O’Reilly Media, Inc.
